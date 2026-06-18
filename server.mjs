@@ -9,6 +9,9 @@ import { Server } from "socket.io";
 
 import AuthRoutes from "./AuthRoutes.js";
 import MessageRoutes from "./MessageRoutes.js";
+import getPrismaInstance from "./PrismaClient.js";
+
+const prisma = getPrismaInstance();
 
 dotenv.config();
 const app = express();
@@ -50,9 +53,327 @@ const db = mysql.createConnection({
 // make db available in your routes via req.app.locals
 app.locals.db = db;
 
+// ───── Background Queue Processor for WhatsApp Profiles ─────────────────────────
+async function processWhatsAppQueue(jobId, phoneNumbers) {
+  console.log(`[Queue] Starting job ${jobId} with ${phoneNumbers.length} numbers`);
+  
+  // Update job status to processing
+  await prisma.profileJob.update({
+    where: { id: jobId },
+    data: { status: "processing" }
+  });
+
+  let processedCount = 0;
+  const BATCH_SIZE = 10; // Process 10 at a time to avoid rate limits
+  const DELAY_MS = 1000; // 1 second delay between batches
+
+  for (let i = 0; i < phoneNumbers.length; i += BATCH_SIZE) {
+    const batch = phoneNumbers.slice(i, i + BATCH_SIZE);
+    
+    await Promise.all(batch.map(async (phoneNumber) => {
+      try {
+        const profileRes = await axios.get(
+          `https://whatsapp-data10.p.rapidapi.com/picture?phoneNumber=${encodeURIComponent(phoneNumber)}&return=url&cache=true`,
+          {
+            headers: {
+              "x-rapidapi-key": process.env.RAPIDAPI_KEY,
+              "x-rapidapi-host": "whatsapp-data10.p.rapidapi.com",
+              "Content-Type": "application/json",
+            },
+          }
+        );
+
+        const profile = profileRes.data || {};
+        const pictureUrl = profile.picture || profile.url || profile.pictureUrl || null;
+
+        await prisma.whatsAppProfile.upsert({
+          where: { phoneNumber },
+          update: {
+            pictureUrl,
+            isValid: true,
+            status: "valid",
+            jobId,
+          },
+          create: {
+            phoneNumber,
+            pictureUrl,
+            isValid: true,
+            status: "valid",
+            jobId,
+          },
+        });
+      } catch (err) {
+        const status = err.response?.status === 400 ? "invalid" : "error";
+        await prisma.whatsAppProfile.upsert({
+          where: { phoneNumber },
+          update: {
+            pictureUrl: null,
+            isValid: false,
+            status,
+            jobId,
+          },
+          create: {
+            phoneNumber,
+            pictureUrl: null,
+            isValid: false,
+            status,
+            jobId,
+          },
+        });
+      }
+    }));
+
+    processedCount += batch.length;
+    
+    // Update progress
+    await prisma.profileJob.update({
+      where: { id: jobId },
+      data: { processedCount }
+    });
+
+    console.log(`[Queue] Job ${jobId}: ${processedCount}/${phoneNumbers.length} processed`);
+
+    // Delay between batches to avoid rate limiting
+    if (i + BATCH_SIZE < phoneNumbers.length) {
+      await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+    }
+  }
+
+  // Mark job as completed
+  await prisma.profileJob.update({
+    where: { id: jobId },
+    data: { status: "completed" }
+  });
+
+  console.log(`[Queue] Job ${jobId} completed!`);
+}
+
+// ───── Batch WhatsApp Profile Endpoints ──────────────────────────────────────
+
+// POST /api/whatsapp-profiles/batch - Start a batch job (up to 1000 numbers)
+app.post("/api/whatsapp-profiles/batch", async (req, res) => {
+  const { phone_numbers } = req.body;
+
+  if (!phone_numbers || !Array.isArray(phone_numbers)) {
+    return res.status(400).json({ error: "Please provide an array of phone_numbers" });
+  }
+
+  if (phone_numbers.length > 1000) {
+    return res.status(400).json({ error: "Maximum 1000 phone numbers per batch" });
+  }
+
+  try {
+    // Create a new job
+    const job = await prisma.profileJob.create({
+      data: {
+        totalCount: phone_numbers.length,
+        processedCount: 0,
+        status: "pending",
+      },
+    });
+
+    // Start background processing (non-blocking)
+    processWhatsAppQueue(job.id, phone_numbers).catch(err => {
+      console.error(`[Queue] Job ${job.id} failed:`, err);
+      prisma.profileJob.update({
+        where: { id: job.id },
+        data: { status: "failed" }
+      }).catch(console.error);
+    });
+
+    res.status(202).json({
+      message: "Batch job started",
+      jobId: job.id,
+      totalCount: phone_numbers.length,
+      status: "pending",
+    });
+  } catch (err) {
+    console.error("Error creating batch job:", err);
+    res.status(500).json({ error: "Failed to create batch job" });
+  }
+});
+
+// GET /api/whatsapp-profiles/jobs/:jobId - Get job status
+app.get("/api/whatsapp-profiles/jobs/:jobId", async (req, res) => {
+  const { jobId } = req.params;
+
+  try {
+    const job = await prisma.profileJob.findUnique({
+      where: { id: jobId },
+    });
+
+    if (!job) {
+      return res.status(404).json({ error: "Job not found" });
+    }
+
+    res.json({
+      jobId: job.id,
+      totalCount: job.totalCount,
+      processedCount: job.processedCount,
+      progress: Math.round((job.processedCount / job.totalCount) * 100),
+      status: job.status,
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    });
+  } catch (err) {
+    console.error("Error fetching job:", err);
+    res.status(500).json({ error: "Failed to fetch job status" });
+  }
+});
+
+// GET /api/whatsapp-profiles/jobs/:jobId/results - Get profiles for a specific job
+app.get("/api/whatsapp-profiles/jobs/:jobId/results", async (req, res) => {
+  const { jobId } = req.params;
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 50;
+  const skip = (page - 1) * limit;
+
+  try {
+    const [profiles, total] = await Promise.all([
+      prisma.whatsAppProfile.findMany({
+        where: { jobId },
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.whatsAppProfile.count({ where: { jobId } }),
+    ]);
+
+    res.json({
+      profiles,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching profiles:", err);
+    res.status(500).json({ error: "Failed to fetch profiles" });
+  }
+});
+
+// GET /api/whatsapp-profiles - Get all profiles from DB
+app.get("/api/whatsapp-profiles", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 50;
+  const status = req.query.status; // optional filter: valid, invalid, error
+  const skip = (page - 1) * limit;
+
+  try {
+    const where = status ? { status } : {};
+    
+    const [profiles, total] = await Promise.all([
+      prisma.whatsAppProfile.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+      }),
+      prisma.whatsAppProfile.count({ where }),
+    ]);
+
+    res.json({
+      profiles,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching profiles:", err);
+    res.status(500).json({ error: "Failed to fetch profiles" });
+  }
+});
+
+// DELETE /api/whatsapp-profiles/jobs/:jobId - Delete all profiles from a job and the job itself
+app.delete("/api/whatsapp-profiles/jobs/:jobId", async (req, res) => {
+  const { jobId } = req.params;
+
+  try {
+    // Delete all profiles associated with the job
+    const deletedProfiles = await prisma.whatsAppProfile.deleteMany({
+      where: { jobId },
+    });
+
+    // Delete the job itself
+    await prisma.profileJob.delete({
+      where: { id: jobId },
+    }).catch(() => {}); // Ignore if job doesn't exist
+
+    res.json({
+      message: "Job and associated profiles deleted",
+      deletedProfilesCount: deletedProfiles.count,
+    });
+  } catch (err) {
+    console.error("Error deleting job:", err);
+    res.status(500).json({ error: "Failed to delete job" });
+  }
+});
+
+// DELETE /api/whatsapp-profiles - Delete all profiles (use with caution)
+app.delete("/api/whatsapp-profiles", async (req, res) => {
+  const { status } = req.query; // optional: only delete profiles with specific status
+
+  try {
+    const where = status ? { status } : {};
+    const deleted = await prisma.whatsAppProfile.deleteMany({ where });
+
+    res.json({
+      message: status ? `Deleted all ${status} profiles` : "Deleted all profiles",
+      deletedCount: deleted.count,
+    });
+  } catch (err) {
+    console.error("Error deleting profiles:", err);
+    res.status(500).json({ error: "Failed to delete profiles" });
+  }
+});
+
+// GET /api/whatsapp-profiles/:phoneNumber - Get a specific profile
+app.get("/api/whatsapp-profiles/:phoneNumber", async (req, res) => {
+  const { phoneNumber } = req.params;
+
+  try {
+    const profile = await prisma.whatsAppProfile.findUnique({
+      where: { phoneNumber },
+    });
+
+    if (!profile) {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+
+    res.json(profile);
+  } catch (err) {
+    console.error("Error fetching profile:", err);
+    res.status(500).json({ error: "Failed to fetch profile" });
+  }
+});
+
+// DELETE /api/whatsapp-profiles/:phoneNumber - Delete a specific profile
+app.delete("/api/whatsapp-profiles/:phoneNumber", async (req, res) => {
+  const { phoneNumber } = req.params;
+
+  try {
+    const profile = await prisma.whatsAppProfile.delete({
+      where: { phoneNumber },
+    });
+
+    res.json({ message: "Profile deleted", profile });
+  } catch (err) {
+    if (err.code === "P2025") {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+    console.error("Error deleting profile:", err);
+    res.status(500).json({ error: "Failed to delete profile" });
+  }
+});
+
 // ───── New Route to Handle WhatsApp Number Validation ─────────────────────────────
 // ───── New Route: WhatsApp Validation + Profile Data ──────────────────────────
-// ✅ 1. WhatsApp Profile Validation Route
+// ✅ 1. WhatsApp Profile Validation Route (using whatsapp-data10 API)
 app.post("/api/validate-whatsapp-profiles", async (req, res) => {
   const { phone_numbers } = req.body;
 
@@ -67,11 +388,12 @@ app.post("/api/validate-whatsapp-profiles", async (req, res) => {
   for (const num of phone_numbers) {
     try {
       const profileRes = await axios.get(
-        `https://whatsapp-profile-data.p.rapidapi.com/mobile?mobile=${encodeURIComponent(num)}`,
+        `https://whatsapp-data10.p.rapidapi.com/picture?phoneNumber=${encodeURIComponent(num)}&return=url&cache=true`,
         {
           headers: {
-            "x-rapidapi-key": process.env.RAPIDAPI_PROFILE_KEY,
-            "x-rapidapi-host": "whatsapp-profile-data.p.rapidapi.com",
+            "x-rapidapi-key": process.env.RAPIDAPI_KEY,
+            "x-rapidapi-host": "whatsapp-data10.p.rapidapi.com",
+            "Content-Type": "application/json",
           },
         }
       );
@@ -79,26 +401,10 @@ app.post("/api/validate-whatsapp-profiles", async (req, res) => {
       const profile = profileRes.data || {};
       let status = "valid";
 
-      // mark invalid if API says so
-      if (
-        profile.code === 400 &&
-        typeof profile.message === "string" &&
-        profile.message.toLowerCase() === "invalid phone number"
-      ) {
-        status = "invalid";
-      }
-
       results.push({
         phone_number: num,
         is_valid: true,
-        avatar:
-          profile.avatar ||
-          profile.profile_pic ||
-          profile.profile?.profile_pic ||
-          profile.profilePic ||
-          profile.profilePicUrl ||
-          profile.data?.head_image ||
-          null,
+        avatar: profile.picture || profile.url || profile.pictureUrl || null,
         profileRaw: profile,
         status,
       });
@@ -107,12 +413,7 @@ app.post("/api/validate-whatsapp-profiles", async (req, res) => {
       const errorCode = err.response?.status;
       let status = "unknown";
 
-      if (
-        errorCode === 400 &&
-        errorData.code === 400 &&
-        typeof errorData.message === "string" &&
-        errorData.message.toLowerCase() === "invalid phone number"
-      ) {
+      if (errorCode === 400) {
         status = "invalid";
       }
 

@@ -41,6 +41,26 @@ model BotReply {
   content String
 }
 
+model WhatsAppProfile {
+  id          Int      @id @default(autoincrement())
+  phoneNumber String   @unique
+  pictureUrl  String?  @db.Text
+  isValid     Boolean  @default(false)
+  status      String   @default("pending") // pending, valid, invalid, error
+  jobId       String?  // to group batch jobs
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model ProfileJob {
+  id            String   @id @default(uuid())
+  totalCount    Int      @default(0)
+  processedCount Int     @default(0)
+  status        String   @default("pending") // pending, processing, completed, failed
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
 
 
 
