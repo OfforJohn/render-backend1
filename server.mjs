@@ -54,6 +54,58 @@ const db = mysql.createConnection({
 app.locals.db = db;
 
 // ───── Background Queue Processor for WhatsApp Profiles ─────────────────────────
+
+// Helper function to fetch a single profile with retry logic
+async function fetchWhatsAppProfileWithRetry(phoneNumber, maxRetries = 3) {
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const profileRes = await axios.get(
+        `https://whatsapp-data10.p.rapidapi.com/picture?phoneNumber=${encodeURIComponent(phoneNumber)}&return=url&cache=true`,
+        {
+          headers: {
+            "x-rapidapi-key": process.env.RAPIDAPI_KEY,
+            "x-rapidapi-host": "whatsapp-data10.p.rapidapi.com",
+            "Content-Type": "application/json",
+          },
+          timeout: 30000, // 30 second timeout per request
+        }
+      );
+
+      const profile = profileRes.data || {};
+      const pictureUrl = profile.picture || profile.url || profile.pictureUrl || null;
+      
+      return { success: true, pictureUrl, isValid: true, status: "valid" };
+    } catch (err) {
+      lastError = err;
+      const statusCode = err.response?.status;
+      
+      // Don't retry for invalid numbers (400) - this is a valid response
+      if (statusCode === 400) {
+        return { success: false, pictureUrl: null, isValid: false, status: "invalid" };
+      }
+      
+      // Don't retry for 404 - number not found
+      if (statusCode === 404) {
+        return { success: false, pictureUrl: null, isValid: false, status: "not_found" };
+      }
+      
+      // For rate limiting (429) or server errors (5xx), retry with exponential backoff
+      if (attempt < maxRetries && (statusCode === 429 || statusCode >= 500 || !statusCode)) {
+        const backoffMs = Math.min(1000 * Math.pow(2, attempt), 10000); // Max 10 seconds
+        console.log(`[Queue] Retry ${attempt}/${maxRetries} for ${phoneNumber} after ${backoffMs}ms (status: ${statusCode || 'timeout'})`);
+        await new Promise(resolve => setTimeout(resolve, backoffMs));
+        continue;
+      }
+    }
+  }
+  
+  // All retries exhausted
+  console.error(`[Queue] Failed after ${maxRetries} retries for ${phoneNumber}:`, lastError?.message);
+  return { success: false, pictureUrl: null, isValid: false, status: "error" };
+}
+
 async function processWhatsAppQueue(jobId, phoneNumbers) {
   console.log(`[Queue] Starting job ${jobId} with ${phoneNumbers.length} numbers`);
   
@@ -64,68 +116,43 @@ async function processWhatsAppQueue(jobId, phoneNumbers) {
   });
 
   let processedCount = 0;
-  const BATCH_SIZE = 10; // Process 10 at a time to avoid rate limits
-  const DELAY_MS = 1000; // 1 second delay between batches
+  const BATCH_SIZE = 5; // Reduced batch size to avoid rate limits
+  const DELAY_BETWEEN_REQUESTS_MS = 200; // Delay between each request within a batch
+  const DELAY_BETWEEN_BATCHES_MS = 2000; // 2 seconds delay between batches
 
   for (let i = 0; i < phoneNumbers.length; i += BATCH_SIZE) {
     const batch = phoneNumbers.slice(i, i + BATCH_SIZE);
     
-    await Promise.all(batch.map(async (phoneNumber) => {
-      try {
-        const profileRes = await axios.get(
-          `https://whatsapp-data10.p.rapidapi.com/picture?phoneNumber=${encodeURIComponent(phoneNumber)}&return=url&cache=true`,
-          {
-            headers: {
-              "x-rapidapi-key": process.env.RAPIDAPI_KEY,
-              "x-rapidapi-host": "whatsapp-data10.p.rapidapi.com",
-              "Content-Type": "application/json",
-            },
-          }
-        );
+    // Process sequentially within each batch to avoid overwhelming the API
+    for (const phoneNumber of batch) {
+      const result = await fetchWhatsAppProfileWithRetry(phoneNumber);
+      
+      await prisma.whatsAppProfile.upsert({
+        where: { phoneNumber },
+        update: {
+          pictureUrl: result.pictureUrl,
+          isValid: result.isValid,
+          status: result.status,
+          jobId,
+        },
+        create: {
+          phoneNumber,
+          pictureUrl: result.pictureUrl,
+          isValid: result.isValid,
+          status: result.status,
+          jobId,
+        },
+      });
 
-        const profile = profileRes.data || {};
-        const pictureUrl = profile.picture || profile.url || profile.pictureUrl || null;
-
-        await prisma.whatsAppProfile.upsert({
-          where: { phoneNumber },
-          update: {
-            pictureUrl,
-            isValid: true,
-            status: "valid",
-            jobId,
-          },
-          create: {
-            phoneNumber,
-            pictureUrl,
-            isValid: true,
-            status: "valid",
-            jobId,
-          },
-        });
-      } catch (err) {
-        const status = err.response?.status === 400 ? "invalid" : "error";
-        await prisma.whatsAppProfile.upsert({
-          where: { phoneNumber },
-          update: {
-            pictureUrl: null,
-            isValid: false,
-            status,
-            jobId,
-          },
-          create: {
-            phoneNumber,
-            pictureUrl: null,
-            isValid: false,
-            status,
-            jobId,
-          },
-        });
+      processedCount++;
+      
+      // Small delay between individual requests
+      if (batch.indexOf(phoneNumber) < batch.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS_MS));
       }
-    }));
-
-    processedCount += batch.length;
+    }
     
-    // Update progress
+    // Update progress after each batch
     await prisma.profileJob.update({
       where: { id: jobId },
       data: { processedCount }
@@ -133,9 +160,9 @@ async function processWhatsAppQueue(jobId, phoneNumbers) {
 
     console.log(`[Queue] Job ${jobId}: ${processedCount}/${phoneNumbers.length} processed`);
 
-    // Delay between batches to avoid rate limiting
+    // Longer delay between batches to avoid rate limiting
     if (i + BATCH_SIZE < phoneNumbers.length) {
-      await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES_MS));
     }
   }
 
